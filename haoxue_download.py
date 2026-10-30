@@ -12,6 +12,7 @@ import sys
 import time
 import os
 import platform
+from datetime import date, timedelta
 from html import unescape
 from html.parser import HTMLParser
 from pathlib import Path
@@ -30,6 +31,15 @@ VERBOSE = False
 AUTH_DIRECTORY_NAME = "HaoxueDownload"
 COOKIE_FILENAME = "cookies.enc"
 KEY_FILENAME = "cookies.key"
+
+PLAYBACK_STATUS_LABELS = {
+    "1": "live",
+    "2": "not started",
+    "3": "replay generating",
+    "4": "no access",
+    "5": "replay unavailable",
+    "6": "replay available",
+}
 
 
 def debug(*args, **kwargs) -> None:
@@ -293,6 +303,32 @@ def print_course_records(data) -> None:
             f"teacher={item.get('course_teacher')}, "
             f"college={item.get('course_college')}, "
             f"term={item.get('course_term')}"
+        )
+
+
+def print_date_records(
+    records: list[dict], hidden_course_ids: set[str] | None = None,
+) -> None:
+    hidden_course_ids = hidden_course_ids or set()
+    print(f"Date records: {len(records)}")
+    for index, item in enumerate(records, 1):
+        status = str(item.get("sub_status", ""))
+        course_id = str(item.get("course_id", ""))
+        hidden_tag = " [hidden-course]" if course_id in hidden_course_ids else ""
+        print(
+            f"  [{index}] course={item.get('course_name')} (id={course_id}), "
+            f"lesson={item.get('sub_name')}, teacher={item.get('course_teacher')}, "
+            f"room={item.get('room_name')}, start={item.get('start_at')}, "
+            f"end={item.get('end_at')}, status={status} "
+            f"({PLAYBACK_STATUS_LABELS.get(status, 'unknown')}){hidden_tag}"
+        )
+    if hidden_course_ids:
+        hidden_records = sum(
+            1 for item in records if str(item.get("course_id", "")) in hidden_course_ids
+        )
+        print(
+            f"Hidden courses: {len(hidden_course_ids)} course(s), "
+            f"{hidden_records} record(s) not returned by course search."
         )
 
 
@@ -1056,6 +1092,164 @@ def fetch_all_courses(session: requests.Session, search: str, api_token: str) ->
     return records
 
 
+def fetch_all_lessons_by_date(
+    session: requests.Session, course_date: str, api_token: str,
+) -> list[dict]:
+    """Fetch every replay record exposed by the app's date-search endpoint."""
+    records: list[dict] = []
+    seen: set[tuple[str, str, str]] = set()
+    page = 1
+    while True:
+        response = course_api(
+            session,
+            "v3/course/get-use-member-sub",
+            {"course_time": course_date, "page": str(page)},
+            api_token,
+        )
+        data = json_data(response)
+        container = data.get("data", data) if isinstance(data, dict) else {}
+        page_records = container.get("lists", []) if isinstance(container, dict) else []
+        if not isinstance(page_records, list):
+            page_records = []
+
+        added = 0
+        for item in page_records:
+            if not isinstance(item, dict):
+                continue
+            identity = (
+                str(item.get("course_id", "")),
+                str(item.get("sub_id", "")),
+                str(item.get("start_at", "")),
+            )
+            if identity not in seen:
+                seen.add(identity)
+                records.append(item)
+                added += 1
+
+        has_next_value = data.get("hasNextPage") if isinstance(data, dict) else None
+        if has_next_value is None and isinstance(container, dict):
+            has_next_value = container.get("hasNextPage")
+        has_next = bool(has_next_value)
+        page_size_value = container.get("pageSize") if isinstance(container, dict) else None
+        try:
+            page_size = int(page_size_value)
+        except (TypeError, ValueError):
+            page_size = 10
+        full_page = len(page_records) >= max(page_size, 10)
+        debug(
+            f"Date page {page}: received={len(page_records)}, added={added}, "
+            f"pageSize={page_size}, hasNextPage={has_next}, "
+            f"full-page-fallback={full_page}"
+        )
+        if not page_records or added == 0 or not (has_next or full_page):
+            break
+        page += 1
+    return records
+
+
+MAX_DATE_RANGE_DAYS = 31
+
+
+def parse_course_dates(value: str) -> list[str]:
+    text = value.strip()
+    if ".." in text:
+        start_text, end_text = (part.strip() for part in text.split("..", 1))
+    else:
+        start_text = end_text = text
+    if not re.fullmatch(r"\d{4}-\d{2}-\d{2}", start_text) or not re.fullmatch(
+        r"\d{4}-\d{2}-\d{2}", end_text
+    ):
+        raise ValueError(f"Invalid date: {text}. Expected YYYY-MM-DD or START..END.")
+    try:
+        start = date.fromisoformat(start_text)
+        end = date.fromisoformat(end_text)
+    except ValueError as exc:
+        raise ValueError(
+            f"Invalid date: {text}. Expected YYYY-MM-DD or START..END."
+        ) from exc
+    if start > end:
+        raise ValueError("Date range start must not be after end.")
+    days = (end - start).days + 1
+    if days > MAX_DATE_RANGE_DAYS:
+        raise ValueError(
+            f"Date range too long: {days} days (max {MAX_DATE_RANGE_DAYS})."
+        )
+    return [(start + timedelta(days=offset)).isoformat() for offset in range(days)]
+
+
+def dedupe_date_records(records: list[dict]) -> list[dict]:
+    unique: list[dict] = []
+    seen: set[tuple[str, str, str]] = set()
+    for item in records:
+        if not isinstance(item, dict):
+            continue
+        identity = (
+            str(item.get("course_id", "")),
+            str(item.get("sub_id", "")),
+            str(item.get("start_at", "")),
+        )
+        if identity in seen:
+            continue
+        seen.add(identity)
+        unique.append(item)
+    return unique
+
+
+def find_hidden_course_ids(
+    session: requests.Session, records: list[dict], api_token: str,
+) -> set[str]:
+    if not records:
+        return set()
+    try:
+        courses = fetch_all_courses(session, "", api_token)
+    except requests.RequestException as exc:
+        print(f"Could not load course list for hidden-course tagging: {type(exc).__name__}.")
+        debug(describe_exception(exc))
+        return set()
+    known_ids = {
+        str(item.get("course_id"))
+        for item in courses
+        if isinstance(item, dict) and item.get("course_id")
+    }
+    hidden_ids = {
+        str(item.get("course_id"))
+        for item in records
+        if isinstance(item, dict) and item.get("course_id")
+        and str(item.get("course_id")) not in known_ids
+    }
+    if hidden_ids:
+        print(
+            f"Course search returned {len(known_ids)} course(s); "
+            f"{len(hidden_ids)} date course(s) are missing from it."
+        )
+    return hidden_ids
+
+
+def offer_subject_download(
+    session: requests.Session, api_token: str, media_cookie: str,
+    course_id: str, subject_id: str, course_name: str = "",
+    replay_title: str = "",
+) -> None:
+    response = course_api(
+        session,
+        "v3/course/get-course-sub-detail",
+        {"course_id": course_id, "sub_id": subject_id},
+        api_token,
+    )
+    show_response(response, response.text)
+    video_data = json_data(response)
+    media_candidates = extract_media_candidates(video_data)
+    video_record = video_data.get("data", video_data) if isinstance(video_data, dict) else {}
+    if isinstance(video_record, dict):
+        course_name = str(video_record.get("course_name") or course_name)
+        replay_title = str(video_record.get("title") or replay_title or subject_id)
+    default_name = safe_filename(
+        f"{course_name or course_id}_{replay_title or subject_id}"
+    ) + ".mp4"
+    debug("Media Cookie available:", "yes (value hidden)" if media_cookie else "no")
+    probe_and_optionally_download(session, media_candidates, media_cookie, default_name)
+
+
 def main(argv: list[str] | None = None) -> int:
     global VERBOSE
     parser = argparse.ArgumentParser(description="Debug PKU playback login and download replay")
@@ -1173,59 +1367,133 @@ def main(argv: list[str] | None = None) -> int:
     api_token = next((c.value for c in session.cookies if c.name == "_token2"), "")
     media_cookie = next((c.value for c in session.cookies if c.name == "_token"), "")
     debug("== 7. Course and playback probe ==")
-    search = input("Course search (empty for all): ")
-    course_records = fetch_all_courses(session, search, api_token)
-    print_course_records({"lists": course_records})
-    course_id = select_record_value(
-        course_records,
-        "Course number or course_id to inspect (empty to stop): ",
-        "course_id",
-    )
-    if course_id:
-        response = course_api(
-            session,
-            "v3/course/get-course-detail",
-            {"course_id": course_id},
-            api_token,
-        )
-        show_response(response, response.text)
-        subject_data = json_data(response)
-        subject_container = subject_data
-        if isinstance(subject_container, dict) and isinstance(subject_container.get("data"), dict):
-            subject_container = subject_container["data"]
-        subjects = subject_container.get("sub_list", []) if isinstance(subject_container, dict) else []
-        if not isinstance(subjects, list):
-            subjects = []
-        print("Scanning for hidden recordings...")
-        hidden_subjects = scan_hidden_subjects(session, course_id, subjects, api_token)
-        print_sub_records(subject_data, hidden_subjects)
-        all_subjects = subjects + hidden_subjects
-        subject_id = select_record_value(
-            all_subjects,
-            "Lesson number or sub_id to inspect (empty to stop): ",
-            "id",
-        )
+    find_mode = input("Find replay by [1] course or [2] date : ").strip().lower()
+    if find_mode in {"2", "d", "date"}:
+        default_date = (date.today() - timedelta(days=1)).isoformat()
+        raw_dates = input(
+            f"Course date YYYY-MM-DD or START..END [{default_date}]: "
+        ).strip() or default_date
+        try:
+            course_dates = parse_course_dates(raw_dates)
+        except ValueError as exc:
+            print(exc)
+            return 2
+        date_records: list[dict] = []
+        for course_date in course_dates:
+            if len(course_dates) > 1:
+                print(f"Fetching date {course_date}...")
+            date_records.extend(
+                fetch_all_lessons_by_date(session, course_date, api_token)
+            )
+        date_records = dedupe_date_records(date_records)
+        hidden_course_ids = find_hidden_course_ids(session, date_records, api_token)
+        print_date_records(date_records, hidden_course_ids)
+        subject_id = ""
+        if date_records:
+            subject_id = select_record_value(
+                date_records,
+                "Record number or sub_id to inspect (empty to stop): ",
+                "sub_id",
+            )
+        else:
+            print("No date records to select.")
         if subject_id:
+            selected = next(
+                (
+                    item for item in date_records
+                    if isinstance(item, dict)
+                    and str(item.get("sub_id", "")) == subject_id
+                ),
+                None,
+            )
+            if selected is None:
+                print(f"No matching record: {subject_id}")
+            else:
+                status = str(selected.get("sub_status", ""))
+                if status != "6":
+                    print(
+                        f"Warning: status={status} "
+                        f"({PLAYBACK_STATUS_LABELS.get(status, 'unknown')}); "
+                        "trying playback detail anyway."
+                    )
+                offer_subject_download(
+                    session,
+                    api_token,
+                    media_cookie,
+                    str(selected.get("course_id", "")),
+                    subject_id,
+                    str(selected.get("course_name", "")),
+                    str(selected.get("sub_name", "")),
+                )
+    else:
+        search = input("Course search (empty for all): ")
+        course_records = fetch_all_courses(session, search, api_token)
+        print_course_records({"lists": course_records})
+        course_id = select_record_value(
+            course_records,
+            "Course number or course_id to inspect (empty to stop): ",
+            "course_id",
+        )
+        if course_id:
             response = course_api(
                 session,
-                "v3/course/get-course-sub-detail",
-                {"course_id": course_id, "sub_id": subject_id},
+                "v3/course/get-course-detail",
+                {"course_id": course_id},
                 api_token,
             )
             show_response(response, response.text)
-            video_data = json_data(response)
-            media_candidates = extract_media_candidates(video_data)
-            course_name = video_data.get("course_name") if isinstance(video_data, dict) else None
-            replay_title = video_data.get("title") if isinstance(video_data, dict) else None
-            if not replay_title:
+            subject_data = json_data(response)
+            subject_container = subject_data
+            if isinstance(subject_container, dict) and isinstance(
+                subject_container.get("data"), dict
+            ):
+                subject_container = subject_container["data"]
+            subjects = (
+                subject_container.get("sub_list", [])
+                if isinstance(subject_container, dict)
+                else []
+            )
+            if not isinstance(subjects, list):
+                subjects = []
+            print("Scanning for hidden recordings...")
+            hidden_subjects = scan_hidden_subjects(
+                session, course_id, subjects, api_token,
+            )
+            print_sub_records(subject_data, hidden_subjects)
+            all_subjects = subjects + hidden_subjects
+            subject_id = select_record_value(
+                all_subjects,
+                "Lesson number or sub_id to inspect (empty to stop): ",
+                "id",
+            )
+            if subject_id:
                 replay_title = next(
-                    (item.get("sub_title") for item in all_subjects
-                     if isinstance(item, dict) and str(item.get("id")) == subject_id),
-                    subject_id,
+                    (
+                        str(item.get("sub_title") or "")
+                        for item in all_subjects
+                        if isinstance(item, dict)
+                        and str(item.get("id")) == subject_id
+                    ),
+                    "",
                 )
-            default_name = safe_filename(f"{course_name or course_id}_{replay_title}") + ".mp4"
-            debug("Media Cookie available:", "yes (value hidden)" if media_cookie else "no")
-            probe_and_optionally_download(session, media_candidates, media_cookie, default_name)
+                selected_course_name = next(
+                    (
+                        str(item.get("course_name") or "")
+                        for item in course_records
+                        if isinstance(item, dict)
+                        and str(item.get("course_id")) == course_id
+                    ),
+                    "",
+                )
+                offer_subject_download(
+                    session,
+                    api_token,
+                    media_cookie,
+                    course_id,
+                    subject_id,
+                    selected_course_name,
+                    replay_title,
+                )
     print("Done. No password, token, or cookie value was printed.")
     return 0
 
